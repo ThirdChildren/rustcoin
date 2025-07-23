@@ -3,13 +3,15 @@ use crate::crypto::{PublicKey, Signature};
 use crate::error::{BtcError, Result};
 use crate::sha256::Hash;
 use crate::util::MerkleRoot;
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Blockchain {
     pub utxos: HashMap<Hash, TransactionOutput>,
+    pub target: U256,
     pub blocks: Vec<Block>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -46,6 +48,7 @@ impl Blockchain {
     pub fn new() -> Self {
         Blockchain {
             utxos: HashMap::new(),
+            target: crate::MIN_TARGET,
             blocks: vec![],
         }
     }
@@ -95,9 +98,62 @@ impl Blockchain {
             //Veriify all transactions in the block
             block.verify_transactions(self.block_height(), &self.utxos)?;
         }
+        //Remove transactions from mempool that are now in the block
+        let block_transaction: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        self.mempool
+            .retain(|tx| !block_transaction.contains(&tx.hash()));
 
         self.blocks.push(block);
+        self.try_adjust_target();
         Ok(())
+    }
+
+    // try to adjust the target of the blockchain
+    pub fn try_adjust_target(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        if self.blocks.len() % crate::DIFFICULTY_UPDATE_INTERVAL as usize != 0 {
+            return;
+        }
+        // measure the time it took to mine the last
+        // crate::DIFFICULTY_UPDATE_INTERVAL blocks
+        // with chrono
+        let start_time = self.blocks
+            [self.blocks.len() - crate::DIFFICULTY_UPDATE_INTERVAL as usize]
+            .header
+            .timestamp;
+        let end_time = self.blocks.last().unwrap().header.timestamp;
+        let time_diff = end_time - start_time;
+        // convert time_diff to seconds
+        let time_diff_seconds = time_diff.num_seconds();
+        // calculate the ideal number of seconds
+        let target_seconds = crate::IDEAL_BLOCK_TIME * crate::DIFFICULTY_UPDATE_INTERVAL;
+        // multiply the current target by actual time divided by ideal time
+        let new_target = BigDecimal::parse_bytes(&self.target.to_string().as_bytes(), 10)
+            .expect("BUG: impossible")
+            * (BigDecimal::from(time_diff_seconds) / BigDecimal::from(target_seconds));
+        // cut off decimal point and everything after
+        // it from string representation of new_target
+        let new_target_str = new_target
+            .to_string()
+            .split('.')
+            .next()
+            .expect("BUG: Expected a decimal point")
+            .to_owned();
+        let new_target: U256 = U256::from_str_radix(&new_target_str, 10).expect("BUG: impossible");
+        // clamp new_target to be within the range of
+        // 4 * self.target and self.target / 4
+        let new_target = if new_target < self.target / 4 {
+            self.target / 4
+        } else if new_target > self.target * 4 {
+            self.target * 4
+        } else {
+            new_target
+        };
+        // if the new target is more than the minimum target,
+        // set it to the minimum target
+        self.target = new_target.min(crate::MIN_TARGET);
     }
 
     pub fn block_height(&self) -> u64 {
@@ -234,8 +290,28 @@ impl BlockHeader {
             target,
         }
     }
+
     pub fn hash(&self) -> Hash {
         Hash::hash(&self)
+    }
+
+    pub fn mine(&mut self, steps: usize) -> bool {
+        // if the block already matches target, return early
+        if self.hash().matches_target(self.target) {
+            return true;
+        }
+        for _ in 0..steps {
+            if let Some(new_nonce) = self.nonce.checked_add(1) {
+                self.nonce = new_nonce;
+            } else {
+                self.nonce = 0;
+                self.timestamp = Utc::now()
+            }
+            if self.hash().matches_target(self.target) {
+                return true;
+            }
+        }
+        false
     }
 }
 
